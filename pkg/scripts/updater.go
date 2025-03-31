@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -154,6 +155,23 @@ var Sources = map[string][]IPSource{
 	},
 }
 
+// Create a custom HTTP client with appropriate timeouts
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConnsPerHost:   10,
+	},
+	Timeout: 60 * time.Second,
+}
+
 // Update downloads IP lists from sources and updates the bloom filter
 func Update(cfg *config.Config, filter *bloom.IPBloomFilter) error {
 	// Ensure directories exist
@@ -162,12 +180,15 @@ func Update(cfg *config.Config, filter *bloom.IPBloomFilter) error {
 		return fmt.Errorf("failed to ensure directories: %w", err)
 	}
 
-	// Download and process sources
-	allIPs := make(map[string]struct{})
-	allCIDRs := make([]string, 0)
+	// Use concurrent maps for thread-safe operations
+	var ipMu sync.Mutex
+	allIPs := make(map[string]struct{}, 100000) // Pre-allocate with reasonable capacity
+
+	var cidrMu sync.Mutex
+	allCIDRs := make([]string, 0, 10000) // Pre-allocate with reasonable capacity
 
 	var wg sync.WaitGroup
-	resultsChan := make(chan *downloadResult, 100) // Allow for larger buffer
+	resultsChan := make(chan *downloadResult, 100)
 
 	// Process all sources from all categories concurrently
 	totalSources := 0
@@ -191,8 +212,11 @@ func Update(cfg *config.Config, filter *bloom.IPBloomFilter) error {
 		close(resultsChan)
 	}()
 
-	// Process results
+	// Process results in batches for better performance
 	var successful, failed int
+	ipBatch := make([]string, 0, 10000)
+	cidrBatch := make([]string, 0, 1000)
+
 	for result := range resultsChan {
 		if result.err != nil {
 			logger.Warning(fmt.Sprintf("failed to process source %s from category %s", result.source.Name, result.category))
@@ -202,13 +226,68 @@ func Update(cfg *config.Config, filter *bloom.IPBloomFilter) error {
 
 		successful++
 
-		// Add IPs to the set
+		// Batch process IPs and CIDRs
 		for _, ip := range result.ips {
 			if isCIDR(ip) {
-				allCIDRs = append(allCIDRs, ip)
+				cidrBatch = append(cidrBatch, ip)
+
+				// Process CIDR batch when it reaches threshold
+				if len(cidrBatch) >= 1000 {
+					cidrMu.Lock()
+					allCIDRs = append(allCIDRs, cidrBatch...)
+					cidrMu.Unlock()
+
+					// If filter is provided, add CIDRs in batch
+					if filter != nil {
+						filter.BatchAddCIDR(cidrBatch)
+					}
+
+					// Reset batch
+					cidrBatch = cidrBatch[:0]
+				}
 			} else {
-				allIPs[ip] = struct{}{}
+				ipBatch = append(ipBatch, ip)
+
+				// Process IP batch when it reaches threshold
+				if len(ipBatch) >= 10000 {
+					ipMu.Lock()
+					for _, batchIP := range ipBatch {
+						allIPs[batchIP] = struct{}{}
+					}
+					ipMu.Unlock()
+
+					// If filter is provided, add IPs in batch
+					if filter != nil {
+						filter.BatchAdd(ipBatch)
+					}
+
+					// Reset batch
+					ipBatch = ipBatch[:0]
+				}
 			}
+		}
+	}
+
+	// Process remaining batches
+	if len(cidrBatch) > 0 {
+		cidrMu.Lock()
+		allCIDRs = append(allCIDRs, cidrBatch...)
+		cidrMu.Unlock()
+
+		if filter != nil {
+			filter.BatchAddCIDR(cidrBatch)
+		}
+	}
+
+	if len(ipBatch) > 0 {
+		ipMu.Lock()
+		for _, batchIP := range ipBatch {
+			allIPs[batchIP] = struct{}{}
+		}
+		ipMu.Unlock()
+
+		if filter != nil {
+			filter.BatchAdd(ipBatch)
 		}
 	}
 
@@ -218,16 +297,27 @@ func Update(cfg *config.Config, filter *bloom.IPBloomFilter) error {
 	if filter == nil {
 		// Create a new filter only if one wasn't provided
 		filter = bloom.New(len(allIPs)+10000, 0.01) // Add some buffer
-	}
 
-	// Add all IPs to the bloom filter
-	for ip := range allIPs {
-		filter.Add(ip)
-	}
+		// Add all IPs to the bloom filter in batches
+		ipBatchSize := 10000
+		ipList := make([]string, 0, ipBatchSize)
 
-	// Add all CIDRs to the bloom filter
-	for _, cidr := range allCIDRs {
-		filter.AddCIDR(cidr)
+		for ip := range allIPs {
+			ipList = append(ipList, ip)
+
+			if len(ipList) >= ipBatchSize {
+				filter.BatchAdd(ipList)
+				ipList = ipList[:0]
+			}
+		}
+
+		// Add remaining IPs
+		if len(ipList) > 0 {
+			filter.BatchAdd(ipList)
+		}
+
+		// Add all CIDRs to the bloom filter
+		filter.BatchAddCIDR(allCIDRs)
 	}
 
 	// Save the bloom filter and IP lists
@@ -263,8 +353,20 @@ func downloadSource(category string, source IPSource, rawDir string, wg *sync.Wa
 
 	logger.Info(fmt.Sprintf("Downloading source: %s (%s)", source.Name, category))
 
-	// Download the source
-	resp, err := http.Get(source.URL)
+	// Use the optimized HTTP client with timeout
+	req, err := http.NewRequest("GET", source.URL, nil)
+	if err != nil {
+		logger.Error(fmt.Sprintf("Failed to create request for %s", source.Name), err)
+		result.err = err
+		results <- result
+		return
+	}
+
+	// Add appropriate headers
+	req.Header.Set("User-Agent", "check-ip-updater/1.0")
+
+	// Download the source with the optimized client
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		logger.Error(fmt.Sprintf("Failed to download %s", source.Name), err)
 		result.err = err
@@ -308,7 +410,7 @@ func downloadSource(category string, source IPSource, rawDir string, wg *sync.Wa
 		return
 	}
 
-	// Parse IPs
+	// Parse IPs with optimized parsers
 	ips := source.Parser(body)
 
 	// Save parsed IPs
@@ -338,30 +440,45 @@ func isCIDR(s string) bool {
 	return strings.Contains(s, "/")
 }
 
-// Parser functions for different formats
+// Optimized parser functions for different formats
+
+// Compiled regex patterns for better performance
+var (
+	proxyListRegex      = regexp.MustCompile(`^(\d+\.\d+\.\d+\.\d+):`)
+	pushingInertiaRegex = regexp.MustCompile(`ipset=(?:[^,]+),([0-9./]+)`)
+	commentRemovalRegex = regexp.MustCompile(`\s*#.*$`)
+)
 
 func parseTextList(data []byte) []string {
-	var ips []string
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+
+	// Pre-allocate result slice with reasonable capacity
+	ips := make([]string, 0, 1000)
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		// Skip empty lines and comments
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// Handle lines with comments after the IP
-		if idx := strings.Index(line, "#"); idx > 0 {
-			line = strings.TrimSpace(line[:idx])
+
+		// Remove comments more efficiently using regex
+		line = commentRemovalRegex.ReplaceAllString(line, "")
+		line = strings.TrimSpace(line)
+
+		if line != "" {
+			ips = append(ips, line)
 		}
-		ips = append(ips, line)
 	}
 	return ips
 }
 
 func parseProxyList(data []byte) []string {
-	var ips []string
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
 	lineCount := 0
+
+	// Pre-allocate result slice
+	ips := make([]string, 0, 1000)
 
 	for scanner.Scan() {
 		lineCount++
@@ -371,8 +488,7 @@ func parseProxyList(data []byte) []string {
 		}
 
 		line := scanner.Text()
-		re := regexp.MustCompile(`^(\d+\.\d+\.\d+\.\d+):`)
-		matches := re.FindStringSubmatch(line)
+		matches := proxyListRegex.FindStringSubmatch(line)
 		if len(matches) > 1 {
 			ips = append(ips, matches[1])
 		}
@@ -382,8 +498,10 @@ func parseProxyList(data []byte) []string {
 }
 
 func parseTorExitNodes(data []byte) []string {
-	var ips []string
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+
+	// Pre-allocate result slice
+	ips := make([]string, 0, 1000)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -398,7 +516,7 @@ func parseTorExitNodes(data []byte) []string {
 	return ips
 }
 
-// Additional parser functions for hosting IP ranges
+// Additional optimized parser functions for hosting IP ranges
 
 func parseAwsIpRanges(data []byte) []string {
 	var awsData struct {
@@ -412,7 +530,9 @@ func parseAwsIpRanges(data []byte) []string {
 		return nil
 	}
 
-	var results []string
+	// Pre-allocate with exact capacity
+	results := make([]string, 0, len(awsData.Prefixes))
+
 	for _, prefix := range awsData.Prefixes {
 		if prefix.IPPrefix != "" {
 			results = append(results, prefix.IPPrefix)
@@ -424,7 +544,9 @@ func parseAwsIpRanges(data []byte) []string {
 
 func parseDigitalOceanIpRanges(data []byte) []string {
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
-	var results []string
+
+	// Pre-allocate results slice
+	results := make([]string, 0, 1000)
 	lineCount := 0
 
 	for scanner.Scan() {
@@ -435,9 +557,8 @@ func parseDigitalOceanIpRanges(data []byte) []string {
 		}
 
 		line := scanner.Text()
-		parts := strings.Split(line, ",")
-		if len(parts) >= 1 {
-			ip := strings.TrimSpace(parts[0])
+		if idx := strings.Index(line, ","); idx > 0 {
+			ip := strings.TrimSpace(line[:idx])
 			if ip != "" {
 				results = append(results, ip)
 			}
@@ -460,7 +581,9 @@ func parseGoogleCloudIpRanges(data []byte) []string {
 		return nil
 	}
 
-	var results []string
+	// Pre-allocate with double capacity (IPv4 + IPv6)
+	results := make([]string, 0, len(googleData.Prefixes)*2)
+
 	for _, prefix := range googleData.Prefixes {
 		if prefix.IPV4Prefix != "" {
 			results = append(results, prefix.IPV4Prefix)
@@ -487,7 +610,14 @@ func parseOracleCloudIpRanges(data []byte) []string {
 		return nil
 	}
 
-	var results []string
+	// Calculate total capacity by counting CIDRs across all regions
+	totalCapacity := 0
+	for _, region := range oracleData.Regions {
+		totalCapacity += len(region.CIDRs)
+	}
+
+	results := make([]string, 0, totalCapacity)
+
 	for _, region := range oracleData.Regions {
 		for _, cidr := range region.CIDRs {
 			if cidr.CIDR != "" {
@@ -512,12 +642,13 @@ func parseLinodeIpRanges(data []byte) []string {
 
 func parsePushingInertiaBlocklist(data []byte) []string {
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
-	var results []string
-	re := regexp.MustCompile(`ipset=(?:[^,]+),([0-9./]+)`)
+
+	// Pre-allocate results slice
+	results := make([]string, 0, 1000)
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		matches := re.FindStringSubmatch(line)
+		matches := pushingInertiaRegex.FindStringSubmatch(line)
 		if len(matches) > 1 {
 			results = append(results, matches[1])
 		}
