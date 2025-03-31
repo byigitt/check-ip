@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -37,11 +38,6 @@ func main() {
 	// Set up signal handling for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		logger.Info("received shutdown signal, stopping services")
-		close(stopCh)
-	}()
 
 	// Initialize the IP bloom filter
 	var filter *bloom.IPBloomFilter
@@ -85,6 +81,24 @@ func main() {
 	if err := apiService.Run(); err != nil {
 		logger.Error("failed to start server", err)
 		log.Fatalf("Failed to start server: %v", err)
+	}
+
+	// Wait for shutdown signal
+	<-sigCh
+	logger.Info("received shutdown signal, initiating graceful shutdown")
+
+	// Create a context with timeout for shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Close stop channel to stop scheduled updates
+	close(stopCh)
+
+	// Shutdown the server
+	if err := apiService.Shutdown(ctx); err != nil {
+		logger.Error("error during server shutdown", err)
+	} else {
+		logger.Success("server gracefully shut down")
 	}
 }
 

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,6 +18,7 @@ type Service struct {
 	Router *gin.Engine
 	Config *config.Config
 	Filter *bloom.IPBloomFilter
+	Server *http.Server
 }
 
 // CheckResult represents the result of an IP check
@@ -49,6 +51,12 @@ func New(cfg *config.Config, filter *bloom.IPBloomFilter) *Service {
 		Router: router,
 		Config: cfg,
 		Filter: filter,
+	}
+
+	// Create HTTP server
+	service.Server = &http.Server{
+		Addr:    ":" + cfg.Port,
+		Handler: router,
 	}
 
 	// Set up routes
@@ -200,7 +208,22 @@ func (s *Service) handleStats(c *gin.Context) {
 		stats.ElementCount, len(s.Filter.GetCIDRs()), stats.FalsePositives*100))
 }
 
-// Run starts the API server
+// Run starts the API server with graceful shutdown support
 func (s *Service) Run() error {
-	return s.Router.Run(":" + s.Config.Port)
+	// Start server in a goroutine so it doesn't block
+	go func() {
+		logger.Info(fmt.Sprintf("server listening on port %s", s.Config.Port))
+		if err := s.Server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("server error", err)
+		}
+	}()
+
+	// Return nil to unblock main thread
+	return nil
+}
+
+// Shutdown gracefully stops the server
+func (s *Service) Shutdown(ctx context.Context) error {
+	logger.Info("shutting down server...")
+	return s.Server.Shutdown(ctx)
 }
